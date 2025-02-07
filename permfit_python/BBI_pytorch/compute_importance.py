@@ -11,7 +11,7 @@ from .RandomForestModified import (
     RandomForestClassifierModified,
     RandomForestRegressorModified,
 )
-from .utils import convert_predict_proba, ordinal_encode, sample_predictions
+from .utils import convert_predict_proba, OrdinalEncode, sample_predictions
 
 warnings.filterwarnings("ignore")
 
@@ -269,7 +269,7 @@ def joblib_compute_conditional(
                 p_col_n["regression"] + p_col_n["classification"] + p_col_n["ordinal"],
                 -1,
             )
-            output["ordinal"] = ordinal_encode(np.array(X_nominal[grp_ord]))
+            output["ordinal"] = OrdinalEncode.fit_transform(np.array(X_nominal[grp_ord]))
             X_col_pred["ordinal"] = []
             for cur_output_ind in range(X_test_minus_idx.shape[0]):
                 current_prediction = []
@@ -345,7 +345,7 @@ def joblib_compute_conditional(
                 p_col_n["regression"] + p_col_n["classification"] + p_col_n["ordinal"],
                 -1,
             )
-            output["ordinal"] = ordinal_encode(np.array(X_nominal[grp_ord]))
+            output["ordinal"] = OrdinalEncode.fit_transform(np.array(X_nominal[grp_ord]))
 
             for cur_output_ind in range(X_test_minus_idx.shape[0]):
                 for cur_ordinal_ind, cur_ordinal in enumerate(output["ordinal"]):

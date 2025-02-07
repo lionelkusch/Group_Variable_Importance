@@ -4,9 +4,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.metrics import log_loss, mean_squared_error
 from sklearn.preprocessing import StandardScaler
 from torchmetrics import Accuracy
+from joblib import Parallel, delayed
 
 
 def create_X_y(
@@ -98,32 +98,12 @@ def create_X_y(
         valid_ind,
     )
 
-
-def sigmoid(x):
-    """The function applies the sigmoid function element-wise to the input array x."""
-    return 1 / (1 + np.exp(-x))
-
-
-def softmax(x):
-    """The function applies the softmax function element-wise to the input array x."""
-    # Ensure numerical stability by subtracting the maximum value of x from each element of x
-    # This prevents overflow errors when exponentiating large numbers
-    x = x - np.max(x, axis=-1, keepdims=True)
-    exp_x = np.exp(x)
-    return exp_x / np.sum(exp_x, axis=-1, keepdims=True)
-
-
 def relu(x):
-    """The function applies the relu function element-wise to the input array x."""
-    return (abs(x) + x) / 2
-
-
-def relu_(x):
-    """The function applies the derivative of the relu function element-wise
-    to the input array x.
+    """The function applies the relu function element-wise to the input array x.
+    https://stackoverflow.com/questions/32109319/how-to-implement-the-relu-function-in-numpy
     """
-    return (x > 0) * 1
-
+    return np.maximum(x, 0, x)
+    # return (abs(x) + x) / 2
 
 def convert_predict_proba(list_probs):
     """If the classification is done using a one-hot encoded variable, the list of
@@ -135,27 +115,34 @@ def convert_predict_proba(list_probs):
         list_probs = np.array(list_probs)[..., 1].T
     return list_probs
 
-
-def ordinal_encode(y):
+class OrdinalEncode:
     """This function encodes the ordinal variable with a special gradual encoding storing also
     the natural order information.
     """
-    list_y = []
-    for y_col in range(y.shape[-1]):
+    def __init__(self):
+        self.mapping_dict = None
+        
+    def fit(self, y):
         # Retrieve the unique values
-        unique_vals = np.unique(y[:, y_col])
+        unique_vals = np.unique(y)
         # Mapping each unique value to its corresponding index
         mapping_dict = {}
         for i, val in enumerate(unique_vals):
             mapping_dict[val] = i + 1
-        # create a zero-filled array for the ordinal encoding
-        y_ordinal = np.zeros((len(y[:, y_col]), len(set(y[:, y_col]))))
-        # set the appropriate indices to 1 for each ordinal value and all lower ordinal values
-        for ind_el, el in enumerate(y[:, y_col]):
-            y_ordinal[ind_el, np.arange(mapping_dict[el])] = 1
-        list_y.append(y_ordinal[:, 1:])
+        self.mapping_dict = mapping_dict
+        return self
 
-    return list_y
+    def transform(self, y):
+        # create a zero-filled array for the ordinal encoding
+        y_ordinal = np.zeros((len(y), len(set(y))))
+        # set the appropriate indices to 1 for each ordinal value and all lower ordinal values
+        for ind_el, el in enumerate(y):
+            y_ordinal[ind_el, np.arange(self.mapping_dict[el])] = 1
+        return y_ordinal[:, 1:]
+    
+    def fit_transform(self, y):
+        self.fit(y)
+        return self.transform(y)
 
 
 def sample_predictions(predictions, random_state=None):
@@ -167,132 +154,6 @@ def sample_predictions(predictions, random_state=None):
     # print(predictions.shape)
     # exit(0)
     return predictions[..., rng.randint(predictions.shape[2]), :]
-
-
-def joblib_ensemble_dnnet(
-    X,
-    y,
-    prob_type="regression",
-    link_func=None,
-    list_cont=None,
-    list_grps=None,
-    bootstrap=False,
-    split_perc=0.8,
-    group_stacking=False,
-    inp_dim=None,
-    n_epoch=200,
-    batch_size=32,
-    beta1=0.9,
-    beta2=0.999,
-    lr=1e-3,
-    l1_weight=1e-2,
-    l2_weight=1e-2,
-    epsilon=1e-8,
-    random_state=None,
-):
-    """
-    Parameters
-    ----------
-    X : {array-like, sparse-matrix}, shape (n_samples, n_features)
-        The input samples.
-    y : {array-like}, shape (n_samples,)
-        The output samples.
-    random_state: int, default=None
-        Fixing the seeds of the random generator
-    """
-
-    pred_v = np.empty(X.shape[0])
-    # Sampling and Train/Validate splitting
-    (
-        X_train_scaled,
-        y_train_scaled,
-        X_valid_scaled,
-        y_valid_scaled,
-        X_scaled,
-        y_valid,
-        scaler_x,
-        scaler_y,
-        valid_ind,
-    ) = create_X_y(
-        X,
-        y,
-        bootstrap=bootstrap,
-        split_perc=split_perc,
-        prob_type=prob_type,
-        list_cont=list_cont,
-        random_state=random_state,
-    )
-
-    current_model = dnn_net(
-        X_train_scaled,
-        y_train_scaled,
-        X_valid_scaled,
-        y_valid_scaled,
-        prob_type=prob_type,
-        n_epoch=n_epoch,
-        batch_size=batch_size,
-        beta1=beta1,
-        beta2=beta2,
-        lr=lr,
-        l1_weight=l1_weight,
-        l2_weight=l2_weight,
-        epsilon=epsilon,
-        list_grps=list_grps,
-        group_stacking=group_stacking,
-        inp_dim=inp_dim,
-        random_state=random_state,
-    )
-
-    if not group_stacking:
-        X_scaled_n = X_scaled.copy()
-    else:
-        X_scaled_n = np.zeros((X_scaled.shape[0], inp_dim[-1]))
-        for grp_ind in range(len(list_grps)):
-            n_layer_stacking = len(current_model[3][grp_ind]) - 1
-            curr_pred = X_scaled[:, list_grps[grp_ind]].copy()
-            for ind_w_b in range(n_layer_stacking):
-                if ind_w_b == 0:
-                    curr_pred = relu(
-                        X_scaled[:, list_grps[grp_ind]].dot(
-                            current_model[3][grp_ind][ind_w_b]
-                        )
-                        + current_model[4][grp_ind][ind_w_b]
-                    )
-                else:
-                    curr_pred = relu(
-                        curr_pred.dot(current_model[3][grp_ind][ind_w_b])
-                        + current_model[4][grp_ind][ind_w_b]
-                    )
-            X_scaled_n[
-                :,
-                list(np.arange(inp_dim[grp_ind], inp_dim[grp_ind + 1])),
-            ] = (
-                curr_pred.dot(current_model[3][grp_ind][n_layer_stacking])
-                + current_model[4][grp_ind][n_layer_stacking]
-            )
-
-    n_layer = len(current_model[0]) - 1
-    for j in range(n_layer):
-        if j == 0:
-            pred = relu(X_scaled_n.dot(current_model[0][j]) + current_model[1][j])
-        else:
-            pred = relu(pred.dot(current_model[0][j]) + current_model[1][j])
-
-    pred = pred.dot(current_model[0][n_layer]) + current_model[1][n_layer]
-
-    if prob_type not in ("classification", "binary"):
-        if prob_type != "ordinal":
-            pred_v = pred * scaler_y.scale_ + scaler_y.mean_
-        else:
-            pred_v = link_func[prob_type](pred)
-        loss = np.std(y_valid) ** 2 - mean_squared_error(y_valid, pred_v[valid_ind])
-    else:
-        pred_v = link_func[prob_type](pred)
-        loss = log_loss(
-            y_valid, np.ones(y_valid.shape) * np.mean(y_valid, axis=0)
-        ) - log_loss(y_valid, pred_v[valid_ind])
-
-    return (current_model, scaler_x, scaler_y, pred_v, loss)
 
 
 def init_weights(layer):
@@ -317,12 +178,58 @@ def Dataset_Loader(X, y, shuffle=False, batch_size=50):
 class DNN(nn.Module):
     """Feedfoward neural network with 4 hidden layers"""
 
-    def __init__(self, input_dim, group_stacking, list_grps, out_dim, prob_type):
-        super().__init__()
-        if prob_type == "classification":
-            self.accuracy = Accuracy(task="multiclass", num_classes=out_dim)
-        else:
+    def __init__(self,
+                 input_dim,
+                 n_classes,
+                 prob_type="regression",
+                 n_epoch=20,
+                 batch_size=32,
+                 batch_size_val=128,
+                 beta1=0.9,
+                 beta2=0.999,
+                 lr=1e-3,
+                 l1_weight=1e-2,
+                 l2_weight=1e-2,
+                 epsilon=1e-3,
+                 list_grps=None,
+                 group_stacking=False,
+                 random_state=2023,
+                 verbose=0
+                 ):
+        super().__init__()        # Set the seed for PyTorch's random number generator
+        self.lr=lr
+        self.beta1=beta1
+        self.beta2=beta2
+        self.epsilon = epsilon
+        if prob_type == "regression":
+            self.loss_fun = F.mse_loss
+            self.accuracy = None
+        elif prob_type == "classification" or "ordinal":
+            self.loss_fun = F.cross_entropy # Calculate loss
+            self.accuracy = Accuracy(task="multiclass", num_classes=n_classes)
+        elif prob_type == "binary":
+            self.loss_fun = F.binary_cross_entropy_with_logits
             self.accuracy = Accuracy(task="binary")
+        else:
+            raise ValueError('bad problem type')
+        self.l1_weight = l1_weight
+        self.l2_weight = l2_weight
+        self.n_epoch = n_epoch
+        self.verbose = verbose
+        self.batch_size = batch_size
+        self.batch_size_val = batch_size_val
+        self.random_state = random_state
+
+        # Specify whether to use GPU or CPU
+        # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cpu")
+        self.random_state = random_state
+        torch.manual_seed(self.random_state)
+
+        # Set the seed for PyTorch's CUDA random number generator(s), if available
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(self.random_state)
+            torch.cuda.manual_seed_all(self.random_state)
         self.list_grps = list_grps
         self.group_stacking = group_stacking
         if group_stacking:
@@ -332,33 +239,15 @@ class DNN(nn.Module):
                         in_features=len(grp),
                         out_features=input_dim[grp_ind + 1] - input_dim[grp_ind],
                     )
-                    # nn.Sequential(
-                    #     nn.Linear(
-                    #         in_features=len(grp),
-                    #         # out_features=max(1, int(0.1 * len(grp))),
-                    #         out_features=input_dim[grp_ind + 1]
-                    #         - input_dim[grp_ind],
-                    #     ),
-                    #     nn.ReLU(),
-                    # nn.Linear(
-                    #     in_features=max(1, int(0.1 * len(grp))),
-                    #     out_features=input_dim[grp_ind + 1]
-                    #     - input_dim[grp_ind],
-                    # ),
-                    # nn.ReLU(),
-                    # nn.Linear(
-                    #     in_features=max(1, int(0.1 * len(grp))),
-                    #     out_features=input_dim[grp_ind + 1]
-                    #     - input_dim[grp_ind],
-                    # ),
-                    # )
                     for grp_ind, grp in enumerate(list_grps)
                 ]
             )
-            input_dim = input_dim[-1]
+            input_dim_single = input_dim[-1]
+        else:
+            input_dim_single = input_dim
         self.layers = nn.Sequential(
             # hidden layers
-            nn.Linear(input_dim, 50),
+            nn.Linear(input_dim_single, 50),
             nn.ReLU(),
             nn.Linear(50, 40),
             nn.ReLU(),
@@ -367,9 +256,110 @@ class DNN(nn.Module):
             nn.Linear(30, 20),
             nn.ReLU(),
             # output layer
-            nn.Linear(20, out_dim),
+            nn.Linear(20, n_classes),
         )
-        self.loss = 0
+        self.to(self.device)
+        # Initializing weights/bias
+        self.apply(init_weights)
+        
+        # save input for cloning 
+        # this feature shouldn't be used #TODO fix it
+        self.prob_type = prob_type
+        self.input_dim = input_dim
+        self.n_classes = n_classes
+        self._name_attribute = ["lr", "beta1", "beta2", "epsilon", "prob_type", "l1_weight",
+                                "l2_weight", "n_epoch", "verbose", "batch_size",
+                                "batch_size_val", "random_state", "list_grps", "group_stacking",
+                                "n_classes", "input_dim", 
+                                ]
+    
+    def set_params(self, **kwargs):
+        """Set the parameters of this estimator."""
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+    
+    def get_params(self):
+        """Get the parameters of this estimator."""
+        out = dict()
+        for key in self._name_attribute:
+            value = getattr(self, key)
+            out[key] = value
+        return out
+
+    def clone(self):
+        return type(self)(**self.get_params())
+
+    def loss(self, X_valid, y_valid):
+        validate_loader = Dataset_Loader(X_valid, y_valid, batch_size=self.batch_size_val)
+        # Validation Phase
+        batch_losses = [self.get_loss(batch) for batch in validate_loader]
+        batch_sizes = [len(batch[0]) for batch in validate_loader]
+        mean_loss = torch.stack(batch_losses).sum().item() / np.sum(batch_sizes)
+        return mean_loss
+        
+    
+    def fit_validate(self, X_train, y_train, X_valid, y_valid):
+        """
+        train_loader: DataLoader for Train data
+        val_loader: DataLoader for Validation data
+        original_loader: DataLoader for Original_data
+        p: Number of variables
+        n_epochs: The number of epochs
+        lr: learning rate
+        beta1: Beta1 parameter for Adam optimizer
+        beta2: Beta2 parameter for Adam optimizer
+        epsilon: Epsilon parameter for Adam optimizer
+        l1_weight: L1 regalurization weight
+        l2_weight: L2 regularization weight
+        verbose: If > 2, the metrics will be printed
+        prob_type: A classification or regression problem
+        """
+        # Creating DataLoaders
+        train_loader = Dataset_Loader(
+            X_train,
+            y_train,
+            shuffle=True,
+            batch_size=self.batch_size,
+        )
+        validate_loader = Dataset_Loader(X_valid, y_valid, batch_size=self.batch_size_val)
+
+        # Adam Optimizer
+        optimizer = torch.optim.Adam(
+            self.parameters(), lr=self.lr, betas=(self.beta1, self.beta2), eps=self.epsilon
+        )
+        best_loss = 1e100
+        for epoch in range(self.n_epoch):
+            # Training Phase
+            self.train()
+            for batch in train_loader:
+                optimizer.zero_grad()
+                loss = self.get_loss(batch)
+
+                loss.backward()
+                optimizer.step()
+                for name, param in self.named_parameters():
+                    if "bias" not in name:
+                        param.data -= (
+                            self.l1_weight * torch.sign(param.data) + self.l2_weight * param.data
+                        )
+            # Validation Phase
+            self.eval()
+            result = [self.validation_step(batch) for batch in validate_loader]
+            loss_valid = 0
+            total = 0
+            for x in result:
+                loss_valid += x["val_loss"] * x["batch_size"]
+                total += x["batch_size"]
+            loss_valid /= total # Combine losses
+            if loss_valid < best_loss:
+                best_loss = loss_valid
+                best_state = copy.deepcopy(self.state_dict())
+            if self.verbose >= 2:
+                self.eval()
+                outputs = [self.validation_step(batch) for batch in train_loader]
+                self.epoch_end(epoch, self.validation_epoch_end(outputs))
+        self.load_state_dict(best_state)
+        return best_loss
 
     def forward(self, x):
         if self.group_stacking:
@@ -379,202 +369,118 @@ class DNN(nn.Module):
             x = torch.cat(list_stacking, dim=1)
         return self.layers(x)
 
-    def training_step(self, batch, device, prob_type):
-        X, y = batch[0].to(device), batch[1].to(device)
+    def get_loss(self, batch, accuracy=False):
+        X, y = batch[0].to(self.device), batch[1].to(self.device)
         y_pred = self(X)  # Generate predictions
-        if prob_type == "regression":
-            loss = F.mse_loss(y_pred, y)
-        elif prob_type == "classification":
-            loss = F.cross_entropy(y_pred, y)  # Calculate loss
-        else:
-            loss = F.binary_cross_entropy_with_logits(y_pred, y)
-        return loss
+        if accuracy:
+            return self.loss_fun(y_pred, y), self.accuracy(y_pred, y.int())
+        else: 
+            return self.loss_fun(y_pred, y)
 
-    def validation_step(self, batch, device, prob_type):
-        X, y = batch[0].to(device), batch[1].to(device)
-        y_pred = self(X)  # Generate predictions
-        if prob_type == "regression":
-            loss = F.mse_loss(y_pred, y)
-            return {
-                "val_mse": loss,
-                "batch_size": len(X),
+    def validation_step(self, batch):
+        if self.accuracy is not None:
+            loss_acc = self.get_loss(batch, accuracy=True)
+            result = {
+                "val_loss": float(loss_acc[0]),
+                "val_acc": float(loss_acc[1]),
+                "batch_size": len(batch[0]),
             }
         else:
-            if prob_type == "classification":
-                loss = F.cross_entropy(y_pred, y)  # Calculate loss
-            else:
-                loss = F.binary_cross_entropy_with_logits(y_pred, y)
-            acc = self.accuracy(y_pred, y.int())
-            return {
-                "val_loss": loss,
-                "val_acc": acc,
-                "batch_size": len(X),
+            result = {
+                "val_loss": float(self.get_loss(batch)),
+                "batch_size": len(batch[0]),
             }
+        return result
 
-    def validation_epoch_end(self, outputs, prob_type):
-        if prob_type in ("classification", "binary"):
-            batch_losses = []
-            batch_accs = []
-            batch_sizes = []
-            for x in outputs:
-                batch_losses.append(x["val_loss"] * x["batch_size"])
-                batch_accs.append(x["val_acc"] * x["batch_size"])
-                batch_sizes.append(x["batch_size"])
-            self.loss = torch.stack(batch_losses).sum().item() / np.sum(
-                batch_sizes
-            )  # Combine losses
-            epoch_acc = torch.stack(batch_accs).sum().item() / np.sum(
-                batch_sizes
-            )  # Combine accuracies
-            return {"val_loss": self.loss, "val_acc": epoch_acc}
-        else:
-            batch_losses = [x["val_mse"] * x["batch_size"] for x in outputs]
-            batch_sizes = [x["batch_size"] for x in outputs]
-            self.loss = torch.stack(batch_losses).sum().item() / np.sum(
-                batch_sizes
-            )  # Combine losses
-            return {"val_mse": self.loss}
+    def validation_epoch_end(self, outputs):
+        total_element = np.sum([x["batch_size"] for x in outputs])
+        batch_losses = np.sum([x["val_loss"] * x["batch_size"] for x in outputs])/ total_element
+        result = {"val_loss": batch_losses}  # Combine losses
+        if self.accuracy is not None:
+            batch_accs = np.sum([x["val_acc"] * x["batch_size"] for x in outputs])/total_element
+            result['val_acc'] = batch_accs
+        return result
 
     def epoch_end(self, epoch, result):
-        if len(result) == 2:
+        if self.accuracy is None:
+            print("Epoch [{}], val_loss: {:.4f}".format(epoch + 1, result["val_loss"]))
+        else:
             print(
                 "Epoch [{}], val_loss: {:.4f}, val_acc: {:.4f}".format(
                     epoch + 1, result["val_loss"], result["val_acc"]
                 )
             )
-        else:
-            print("Epoch [{}], val_mse: {:.4f}".format(epoch + 1, result["val_mse"]))
+    
+    def score(self, X, y):
+        self.eval()
+        return self.get_loss([X, y])
+        
+    def _get_bais_weight(self):
+        weight = []
+        bias = []
+        for name, param in self.state_dict().items():
+            if name.split(".")[0] == "layers":
+                if name.split(".")[-1] == "weight":
+                    weight.append(param.numpy().T)
+                if name.split(".")[-1] == "bias":
+                    bias.append(param.numpy()[np.newaxis, :])
+        return [weight, bias]    
+    
+
+    def _get_bais_weight_stack(self, list_grps):
+        weight_stack = [[].copy() for _ in range(len(list_grps))]
+        bias_stack = [[].copy() for _ in range(len(list_grps))]
+        for name, param in self.state_dict().items():
+            if name.split(".")[0] == "layers_stacking":
+                curr_ind = int(name.split(".")[1])
+                if name.split(".")[-1] == "weight":
+                    weight_stack[curr_ind].append(param.numpy().T)
+                if name.split(".")[-1] == "bias":
+                    bias_stack[curr_ind].append(param.numpy()[np.newaxis, :])
+        return [weight_stack, bias_stack]
 
 
-def evaluate(model, loader, device, prob_type):
-    outputs = [model.validation_step(batch, device, prob_type) for batch in loader]
-    return model.validation_epoch_end(outputs, prob_type)
-
-
-def dnn_net(
-    X_train,
-    y_train,
-    X_valid,
-    y_valid,
-    prob_type="regression",
-    n_epoch=200,
-    batch_size=32,
-    batch_size_val=128,
-    beta1=0.9,
-    beta2=0.999,
-    lr=1e-3,
-    l1_weight=1e-2,
-    l2_weight=1e-2,
-    epsilon=1e-8,
-    list_grps=None,
-    group_stacking=False,
-    inp_dim=None,
-    random_state=2023,
-    verbose=0,
-):
-    """
-    train_loader: DataLoader for Train data
-    val_loader: DataLoader for Validation data
-    original_loader: DataLoader for Original_data
-    p: Number of variables
-    n_epochs: The number of epochs
-    lr: learning rate
-    beta1: Beta1 parameter for Adam optimizer
-    beta2: Beta2 parameter for Adam optimizer
-    epsilon: Epsilon parameter for Adam optimizer
-    l1_weight: L1 regalurization weight
-    l2_weight: L2 regularization weight
-    verbose: If > 2, the metrics will be printed
-    prob_type: A classification or regression problem
-    """
-    # Creating DataLoaders
-    train_loader = Dataset_Loader(
-        X_train,
-        y_train,
-        shuffle=True,
-        batch_size=batch_size,
-    )
-    validate_loader = Dataset_Loader(X_valid, y_valid, batch_size=batch_size_val)
-    # Set the seed for PyTorch's random number generator
-    torch.manual_seed(random_state)
-
-    # Set the seed for PyTorch's CUDA random number generator(s), if available
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(random_state)
-        torch.cuda.manual_seed_all(random_state)
-
-    # Specify whether to use GPU or CPU
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device("cpu")
-
-    if prob_type in ("regression", "binary"):
-        out_dim = 1
-    else:
-        out_dim = y_train.shape[-1]
-
-    # DNN model
-    input_dim = inp_dim.copy() if group_stacking else X_train.shape[1]
-    model = DNN(input_dim, group_stacking, list_grps, out_dim, prob_type)
-    model.to(device)
-    # Initializing weights/bias
-    model.apply(init_weights)
-    # Adam Optimizer
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=lr, betas=(beta1, beta2), eps=epsilon
-    )
-
-    best_loss = 1e100
-    for epoch in range(n_epoch):
-        # Training Phase
-        model.train()
-        for batch in train_loader:
-            optimizer.zero_grad()
-            loss = model.training_step(batch, device, prob_type)
-
-            loss.backward()
-            optimizer.step()
-            for name, param in model.named_parameters():
-                if "bias" not in name:
-                    # if name.split(".")[0] == "layers_stacking":
-                    #     param.data -= l2_weight * param.data
-                    # else:
-                    param.data -= (
-                        l1_weight * torch.sign(param.data) + l2_weight * param.data
+    def get_prediction_group(self, X_scaled, inp_dim, list_grps):
+        X_scaled_n = np.zeros((X_scaled.shape[0], inp_dim[-1]))
+        weight_stack, bias_stack = self._get_bais_weight_stack(list_grps)
+        for grp_ind in range(len(list_grps)):
+            n_layer_stacking = len(weight_stack[grp_ind]) - 1
+            curr_pred = X_scaled[:, list_grps[grp_ind]].copy()
+            for ind_w_b in range(n_layer_stacking):
+                if ind_w_b == 0:
+                    curr_pred = relu(
+                        X_scaled[:, list_grps[grp_ind]].dot(
+                            weight_stack[grp_ind][ind_w_b]
+                        )
+                        + bias_stack[grp_ind][ind_w_b]
                     )
-        # Validation Phase
-        model.eval()
-        result = evaluate(model, validate_loader, device, prob_type)
-        if model.loss < best_loss:
-            best_loss = model.loss
-            dict_params = copy.deepcopy(model.state_dict())
-        if verbose >= 2:
-            model.epoch_end(epoch, result)
+                else:
+                    curr_pred = relu(
+                        curr_pred.dot(weight_stack[grp_ind][ind_w_b])
+                        + bias_stack[grp_ind][ind_w_b]
+                    )
+            X_scaled_n[
+                :,
+                list(np.arange(inp_dim[grp_ind], inp_dim[grp_ind + 1])),
+            ] = (
+                curr_pred.dot(weight_stack[grp_ind][n_layer_stacking])
+                + bias_stack[grp_ind][n_layer_stacking]
+            )
+        return X_scaled_n
+        
+        
+    def predict(self, X_scaled_n):
+        #Todo improve it by using torch function
+        weight, bias = self._get_bais_weight()
+        n_layer = len(weight) - 1
+        for j in range(n_layer):
+            if j == 0:
+                pred = relu(X_scaled_n.dot(weight[j]) + bias[j])
+            else:
+                pred = relu(pred.dot(weight[j]) + bias[j])
 
-    best_weight = []
-    best_bias = []
-    best_weight_stack = [[].copy() for _ in range(len(list_grps))]
-    best_bias_stack = [[].copy() for _ in range(len(list_grps))]
-
-    for name, param in dict_params.items():
-        if name.split(".")[0] == "layers":
-            if name.split(".")[-1] == "weight":
-                best_weight.append(param.numpy().T)
-            if name.split(".")[-1] == "bias":
-                best_bias.append(param.numpy()[np.newaxis, :])
-        if name.split(".")[0] == "layers_stacking":
-            curr_ind = int(name.split(".")[1])
-            if name.split(".")[-1] == "weight":
-                best_weight_stack[curr_ind].append(param.numpy().T)
-            if name.split(".")[-1] == "bias":
-                best_bias_stack[curr_ind].append(param.numpy()[np.newaxis, :])
-
-    return [
-        best_weight,
-        best_bias,
-        best_loss,
-        best_weight_stack,
-        best_bias_stack,
-    ]
+        pred = pred.dot(weight[n_layer]) + bias[n_layer]
+        return pred
 
 
 def compute_imp_std(pred_scores):
@@ -605,3 +511,68 @@ def compute_imp_std(pred_scores):
         / (np.sum(weights) - 1)
     )
     return (imp, std)
+
+
+def hyper_tuning(
+    estimator,
+    X,
+    y,
+    name_param,
+    list_hyper,
+    encode_outcome=lambda x: x,
+    bootstrap=True,
+    split_perc=0.8,
+    prob_type = "regression",
+    list_cont=None,
+    random_state=None,
+    n_jobs=None,
+    n_ensemble=10,
+    verbose=0,
+):
+    (
+        X_train_scaled,
+        y_train_scaled,
+        X_valid_scaled,
+        y_valid_scaled,
+        X_scaled,
+        __,
+        scaler_x,
+        scaler_y,
+        ___,
+    ) = create_X_y(
+        X,
+        y,
+        bootstrap=bootstrap,
+        split_perc=split_perc,
+        prob_type=prob_type,
+        list_cont=list_cont,
+        random_state=random_state,
+    )
+    parallel = Parallel(
+        n_jobs=min(n_jobs, n_ensemble), verbose=verbose
+    )
+    y_train_scaled = encode_outcome(y_train_scaled, train=True)
+    y_valid_scaled = encode_outcome(y_valid_scaled)
+    def fit_validate_estimator(X_train, y_train, X_test, y_test, value_param):
+        estimator_x = estimator.clone()
+        dict_param = {}
+        for index, name in enumerate(name_param):
+            dict_param[name] = value_param[index]
+        estimator_x.set_params(**dict_param)
+        return estimator_x.fit_validate(X_train, y_train, X_test, y_test)
+    list_loss = [
+        parallel(
+                delayed(fit_validate_estimator)(
+                    X_train_scaled,
+                    y_train_scaled[i, ...],
+                    X_valid_scaled,
+                    y_valid_scaled[i, ...],
+                    value_param = el
+                )
+                for el in list_hyper
+            )
+        for i in range(y_train_scaled.shape[0])
+    ]
+    ind_min = np.argmin(list_loss)
+    best_hyper = list_hyper[ind_min]
+    return best_hyper

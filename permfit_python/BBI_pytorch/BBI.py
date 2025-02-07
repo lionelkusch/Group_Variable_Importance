@@ -26,7 +26,8 @@ from .compute_importance import (
     joblib_compute_permutation,
 )
 from .Dnn_learner import DNN_learner
-from .utils import convert_predict_proba, create_X_y, compute_imp_std
+from .Dnn_learner_single import BaggingDNN
+from .utils import convert_predict_proba, create_X_y, compute_imp_std, DNN, hyper_tuning
 
 
 class BlockBasedImportance(BaseEstimator, TransformerMixin):
@@ -376,16 +377,26 @@ class BlockBasedImportance(BaseEstimator, TransformerMixin):
         # Initialize the first estimator (block learner)
         if self.estimator is None:
             self.estimator = DNN_learner(
-                prob_type=self.prob_type,
+                estimator_default=BaggingDNN(
                 encode=True,
                 do_hyper=False,
+                verbose=self.verbose,
+                prob_type=self.prob_type,
                 list_cont=self.list_cont,
                 list_grps=self.list_grps,
-                group_stacking=self.group_stacking,
                 n_jobs=self.n_jobs,
+                group_stacking=self.group_stacking,
                 inp_dim=self.inp_dim,
-                random_state=self.random_state,
-                verbose=self.verbose,
+                estimator_default=DNN(
+                    self.inp_dim,
+                    1,
+                    prob_type=self.prob_type,
+                    list_grps=self.list_grps,
+                    group_stacking=self.group_stacking,
+                    random_state=self.random_state,
+                    verbose=self.verbose
+                    ) 
+                )
             )
             self.type = "DNN"
             # Initializing the dictionary for tuning the hyperparameters
@@ -495,12 +506,17 @@ class BlockBasedImportance(BaseEstimator, TransformerMixin):
                 list_hyper = list(itertools.product(*list(self.dict_hyper.values())))
             list_loss = []
             if self.type == "DNN":
-                list_loss = self.estimator.hyper_tuning(
-                    X_train_scaled,
-                    y_train_scaled,
-                    X_valid_scaled,
-                    y_valid_scaled,
+                best_hyper = hyper_tuning(self.estimator.estimator_default.estimator_default,
+                    X, y,
+                    list(self.dict_hyper.keys()),
                     list_hyper,
+                    encode_outcome=self.estimator.estimator_default.encode_outcome,
+                    bootstrap=self.bootstrap,
+                    split_perc=self.split_perc,
+                    prob_type=self.prob_type,
+                    list_cont=self.list_cont,
+                    n_ensemble=self.estimator.estimator_default.n_ensemble,
+                    n_jobs=self.n_jobs,
                     random_state=self.random_state,
                 )
             else:
@@ -539,8 +555,8 @@ class BlockBasedImportance(BaseEstimator, TransformerMixin):
 
                         list_loss.append(self.loss(y_valid_curr, func(X_valid_scaled)))
 
-            ind_min = np.argmin(list_loss)
-            best_hyper = list_hyper[ind_min]
+                ind_min = np.argmin(list_loss)
+                best_hyper = list_hyper[ind_min]
             if not isinstance(best_hyper, dict):
                 best_hyper = dict(zip(self.dict_hyper.keys(), best_hyper))
 

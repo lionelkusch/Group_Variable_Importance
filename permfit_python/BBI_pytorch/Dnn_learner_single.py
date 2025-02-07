@@ -1,5 +1,4 @@
 import itertools
-
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
@@ -7,19 +6,18 @@ from sklearn.base import BaseEstimator
 from sklearn.metrics import log_loss, mean_squared_error
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.utils.validation import check_is_fitted
+from scipy.special import expit as sigmoid
+from scipy.special import softmax
 
 from .utils import (
+    DNN,
     create_X_y,
-    dnn_net,
-    joblib_ensemble_dnnet,
-    ordinal_encode,
-    relu,
-    sigmoid,
-    softmax,
+    OrdinalEncode,
+    hyper_tuning
 )
 
 
-class DNN_learner_single(BaseEstimator):
+class BaggingDNN(BaseEstimator):
     """
     Parameters
     ----------
@@ -81,45 +79,32 @@ class DNN_learner_single(BaseEstimator):
         dict_hyper=None,
         n_ensemble=10,
         min_keep=10,
-        batch_size=32,
-        batch_size_val=128,
-        n_epoch=200,
+        estimator_default=None,
         verbose=0,
         bootstrap=True,
         split_perc=0.8,
         prob_type="regression",
         list_cont=None,
         list_grps=None,
-        beta1=0.9,
-        beta2=0.999,
-        lr=1e-3,
-        epsilon=1e-8,
-        l1_weight=1e-2,
-        l2_weight=0,
         n_jobs=1,
         group_stacking=False,
         inp_dim=None,
         random_state=2023,
     ):
         self.encode = encode
-        self.do_hyper = do_hyper
-        self.dict_hyper = dict_hyper
+        self.do_hyper = do_hyper        # Initializing the dictionary for tuning the hyperparameters
+
         self.n_ensemble = n_ensemble
         self.min_keep = min_keep
-        self.batch_size = batch_size
-        self.batch_size_val = batch_size_val
-        self.n_epoch = n_epoch
         self.verbose = verbose
         self.bootstrap = bootstrap
         self.split_perc = split_perc
         self.prob_type = prob_type
+        if prob_type in ("regression", "ordinal"):
+            self.loss_func = lambda y,pred: np.std(y) ** 2 - mean_squared_error(y, pred)
+        else:
+            self.loss_func = lambda y,pred: log_loss(y, np.ones(y.shape) * np.mean(y, axis=0)) - log_loss(y, pred)
         self.list_grps = list_grps
-        self.beta1 = beta1
-        self.beta2 = beta2
-        self.lr = lr
-        self.epsilon = epsilon
-        self.l1_weight = l1_weight
-        self.l2_weight = l2_weight
         self.list_cont = list_cont
         self.n_jobs = n_jobs
         self.group_stacking = group_stacking
@@ -132,8 +117,27 @@ class DNN_learner_single(BaseEstimator):
             "binary": sigmoid,
         }
         self.is_encoded = False
+        if estimator_default is None:
+            self.estimator_default = DNN(
+                inp_dim,
+                1,
+                prob_type=prob_type,
+                list_grps=list_grps,
+                group_stacking=group_stacking,
+                random_state=random_state,
+                verbose=verbose)
+        else:
+            self.estimator_default = estimator_default
+        if dict_hyper is None and type(self.estimator_default) is DNN:
+            self.dict_hyper = {
+                "lr": [1e-2, 1e-3, 1e-4],
+                "l1_weight": [0, 1e-2, 1e-4],
+                "l2_weight": [0, 1e-2, 1e-4],
+            }
+        else:
+            self.dict_hyper = dict_hyper
 
-    def fit(self, X, y=None):
+    def fit(self, X, y):
         """Build the DNN learner with the training set (X, y)
         Parameters
         ----------
@@ -147,6 +151,8 @@ class DNN_learner_single(BaseEstimator):
         self : object
             Returns self.
         """
+        if self.n_ensemble == 1:
+            raise ValueError('Not taking in consideration value of n_ensemble < 1')
         # Disabling the encoding parameter with the regression case
         if self.prob_type == "regression":
             if len(y.shape) != 2:
@@ -157,14 +163,6 @@ class DNN_learner_single(BaseEstimator):
             y = self.encode_outcome(y)
             self.is_encoded = True
             y = np.squeeze(y, axis=0)
-
-        # Initializing the dictionary for tuning the hyperparameters
-        if self.dict_hyper is None:
-            self.dict_hyper = {
-                "lr": [1e-2, 1e-3, 1e-4],
-                "l1_weight": [0, 1e-2, 1e-4],
-                "l2_weight": [0, 1e-2, 1e-4],
-            }
 
         # Switch to the special binary case
         if (self.prob_type == "classification") and (y.shape[-1] < 3):
@@ -189,7 +187,11 @@ class DNN_learner_single(BaseEstimator):
 
         # Hyperparameter tuning
         if self.do_hyper:
-            self.__tuning_hyper(X, y)
+            list_hyper = list(itertools.product(*list(self.dict_hyper.values())))
+            name_param = list(self.dict_hyper.keys())
+            best_hyper = hyper_tuning(self.estimator_default, X, y, name_param, list_hyper,
+                                    encode_outcome=self.encode_outcome)
+            self.estimator_default.set_params(**best_hyper)
 
         parallel = Parallel(
             n_jobs=min(self.n_jobs, self.n_ensemble), verbose=self.verbose
@@ -200,6 +202,8 @@ class DNN_learner_single(BaseEstimator):
                     delayed(joblib_ensemble_dnnet)(
                         X,
                         y,
+                        self.estimator_default,
+                        self.loss_func,
                         prob_type=self.prob_type,
                         link_func=self.link_func,
                         list_cont=self.list_cont,
@@ -208,14 +212,6 @@ class DNN_learner_single(BaseEstimator):
                         split_perc=self.split_perc,
                         group_stacking=self.group_stacking,
                         inp_dim=self.inp_dim,
-                        n_epoch=self.n_epoch,
-                        batch_size=self.batch_size,
-                        beta1=self.beta1,
-                        beta2=self.beta2,
-                        lr=self.lr,
-                        l1_weight=self.l1_weight,
-                        l2_weight=self.l2_weight,
-                        epsilon=self.epsilon,
                         random_state=list_seeds[i],
                     )
                     for i in range(self.n_ensemble)
@@ -224,9 +220,6 @@ class DNN_learner_single(BaseEstimator):
         )
         pred_m = np.array(res_ens[3])
         loss = np.array(res_ens[4])
-
-        if self.n_ensemble == 1:
-            return [(res_ens[0][0], (res_ens[1][0], res_ens[2][0]))]
 
         # Keeping the optimal subset of DNNs
         sorted_loss = loss.copy()
@@ -248,11 +241,10 @@ class DNN_learner_single(BaseEstimator):
             for i in range(self.n_ensemble)
             if keep_dnn[i]
         ]
-        self.pred = [None] * len(self.optimal_list)
         self.is_fitted = True
         return self
 
-    def encode_outcome(self, y, train=True):
+    def encode_outcome(self, y, train=False):
         list_y = []
         if len(y.shape) != 2:
             y = y.reshape(-1, 1)
@@ -262,102 +254,46 @@ class DNN_learner_single(BaseEstimator):
         for col in range(y.shape[1]):
             if train:
                 # Encoding the target with the classification case
-                if self.prob_type in ("classification", "binary"):
-                    self.enc_y.append(OneHotEncoder(handle_unknown="ignore"))
-                    curr_y = self.enc_y[col].fit_transform(y[:, [col]]).toarray()
+                if self.prob_type in ("classification", "binary", "ordinal"):
+                    if self.prob_type == "ordinal":
+                        self.enc_y.append(OrdinalEncode())
+                    else:
+                        self.enc_y.append(OneHotEncoder(handle_unknown="ignore", sparse_output=False))
+                    curr_y = self.enc_y[col].fit_transform(y[:, [col]])
                     list_y.append(curr_y)
-
-                # Encoding the target with the ordinal case
-                if self.prob_type == "ordinal":
-                    y = ordinal_encode(y)
-
             else:
-                # Encoding the target with the classification case
-                if self.prob_type in ("classification", "binary"):
-                    curr_y = self.enc_y[col].transform(y[:, [col]]).toarray()
+                # Encoding the target with the classification case 
+                if self.prob_type in ("classification", "binary", "ordinal"):
+                    curr_y = self.enc_y[col].transform(y[:, [col]])
                     list_y.append(curr_y)
-
-                ## ToDo Add the ordinal case
+                
         return np.array(list_y)
 
-    def hyper_tuning(
-        self,
-        X_train,
-        y_train,
-        X_valid,
-        y_valid,
-        list_hyper=None,
-        random_state=None,
-    ):
-        parallel = Parallel(
-            n_jobs=min(self.n_jobs, self.n_ensemble), verbose=self.verbose
-        )
-        y_train = self.encode_outcome(y_train)
-        y_valid = self.encode_outcome(y_valid, train=False)
-        return [
-            list(
-                zip(
-                    *parallel(
-                        delayed(dnn_net)(
-                            X_train,
-                            y_train[i, ...],
-                            X_valid,
-                            y_valid[i, ...],
-                            prob_type=self.prob_type,
-                            n_epoch=self.n_epoch,
-                            batch_size=self.batch_size,
-                            beta1=self.beta1,
-                            beta2=self.beta2,
-                            lr=el[0],
-                            l1_weight=el[1],
-                            l2_weight=el[2],
-                            epsilon=self.epsilon,
-                            list_grps=self.list_grps,
-                            group_stacking=self.group_stacking,
-                            inp_dim=self.inp_dim,
-                            random_state=random_state,
-                        )
-                        for el in list_hyper
-                    )
-                )
-            )[2]
-            for i in range(y_train.shape[0])
-        ]
+    def _predict(self, X, scale=True):
+        # Process the common prediction part
+        pred_list = self.__pred_common(X, scale=scale)
 
-    def __tuning_hyper(self, X, y):
-        (
-            X_train_scaled,
-            y_train_scaled,
-            X_valid_scaled,
-            y_valid_scaled,
-            X_scaled,
-            __,
-            scaler_x,
-            scaler_y,
-            ___,
-        ) = create_X_y(
-            X,
-            y,
-            bootstrap=self.bootstrap,
-            split_perc=self.split_perc,
-            prob_type=self.prob_type,
-            list_cont=self.list_cont,
-            random_state=self.random_state,
-        )
-        list_hyper = list(itertools.product(*list(self.dict_hyper.values())))
-        list_loss = self.hyper_tuning(
-            X_train_scaled,
-            y_train_scaled,
-            X_valid_scaled,
-            y_valid_scaled,
-            list_hyper,
-            random_state=self.random_state,
-        )
-        ind_min = np.argmin(list_loss)
-        best_hyper = list_hyper[ind_min]
-        if not isinstance(best_hyper, dict):
-            best_hyper = dict(zip(self.dict_hyper.keys(), best_hyper))
-        self.set_params(**best_hyper)
+        res_pred = np.zeros((pred_list[0].shape))
+        total_n_elements = 0
+        for ind_mod, pred in enumerate(pred_list):
+            if self.prob_type == "regression":
+                res_pred += (
+                    pred * self.optimal_list[ind_mod][1][1].scale_
+                    + self.optimal_list[ind_mod][1][1].mean_
+                )
+            else:
+                res_pred += self.link_func[self.prob_type](pred)
+            total_n_elements += 1
+        res_pred = res_pred.copy() / total_n_elements
+        if self.prob_type == "binary":
+            res_pred = np.array([[1-res_pred[i][0], res_pred[i][0]] for i in range(res_pred.shape[0])])
+        
+        return res_pred
+    
+    def score(self, X, y, scale=True):
+        res_pred = self._predict(X, scale=scale)
+        loss = self.loss_func(y, res_pred)
+        return loss
 
     def predict(self, X, scale=True):
         """Predict regression target for X.
@@ -374,25 +310,8 @@ class DNN_learner_single(BaseEstimator):
         """
         if self.prob_type != "regression":
             raise Exception("Use the predict_proba function for classification")
+        return self._predict(X, scale=scale)
 
-        # Prepare the test set for the prediction
-        if scale:
-            X = self.__scale_test(X)
-
-        # Process the common prediction part
-        self.__pred_common(X)
-
-        res_pred = np.zeros((self.pred[0].shape))
-        total_n_elements = 0
-        for ind_mod, pred in enumerate(self.pred):
-            res_pred += (
-                pred * self.optimal_list[ind_mod][1][1].scale_
-                + self.optimal_list[ind_mod][1][1].mean_
-            )
-            total_n_elements += 1
-        res_pred = res_pred.copy() / total_n_elements
-
-        return res_pred
 
     def predict_proba(self, X, scale=True):
         """Predict class probabilities for X.
@@ -409,24 +328,8 @@ class DNN_learner_single(BaseEstimator):
         """
         if self.prob_type == "regression":
             raise Exception("Use the predict function for classification")
+        return self._predict(X, scale=scale)
 
-        # Prepare the test set for the prediction
-        if scale:
-            X = self.__scale_test(X)
-
-        # Process the common prediction part
-        self.__pred_common(X)
-
-        res_pred = np.zeros((self.pred[0].shape))
-        total_n_elements = 0
-        for pred in self.pred:
-            res_pred += self.link_func[self.prob_type](pred)
-            total_n_elements += 1
-        res_pred = res_pred.copy() / total_n_elements
-        if self.prob_type == "binary":
-            res_pred = np.array([[1-res_pred[i][0], res_pred[i][0]] for i in range(res_pred.shape[0])])
-        
-        return res_pred
 
     def __scale_test(self, X):
         """This function prepares the input for the DNN estimator either in the default
@@ -440,7 +343,9 @@ class DNN_learner_single(BaseEstimator):
         check_is_fitted(self, ["is_fitted"])
 
         if isinstance(X, pd.DataFrame):
-            X = np.array(X)
+            X_ = np.array(X)
+        else:
+            X_ = X
 
         # The input will be either the original input or the result
         # of the provided sub-linear layers in a stacking way for the different groups
@@ -448,103 +353,127 @@ class DNN_learner_single(BaseEstimator):
         if self.group_stacking:
             X_test_n = [None] * len(self.optimal_list)
             for mod in range(len(self.optimal_list)):
-                X_test_scaled = X.copy()
+                X_test_scaled = X_.copy()
                 if len(self.list_cont) > 0:
                     X_test_scaled[:, self.list_cont] = self.optimal_list[mod][1][
                         0
                     ].transform(X_test_scaled[:, self.list_cont])
-                X_test_n_curr = np.zeros(
-                    (
-                        X_test_scaled.shape[0],
-                        self.inp_dim[-1],
-                    )
-                )
-                for grp_ind in range(len(self.list_grps)):
-                    curr_pred = X_test_scaled[:, self.list_grps[grp_ind]].copy()
-                    n_layer_stacking = len(self.optimal_list[mod][0][3][grp_ind]) - 1
-                    for ind_w_b in range(n_layer_stacking):
-                        if ind_w_b == 0:
-                            curr_pred = relu(
-                                X_test_scaled[:, self.list_grps[grp_ind]].dot(
-                                    self.optimal_list[mod][0][3][grp_ind][ind_w_b]
-                                )
-                                + self.optimal_list[mod][0][4][grp_ind][ind_w_b]
-                            )
-                        else:
-                            curr_pred = relu(
-                                curr_pred.dot(
-                                    self.optimal_list[mod][0][3][grp_ind][ind_w_b]
-                                )
-                                + self.optimal_list[mod][0][4][grp_ind][ind_w_b]
-                            )
-                    X_test_n_curr[
-                        :,
-                        list(
-                            np.arange(
-                                self.inp_dim[grp_ind],
-                                self.inp_dim[grp_ind + 1],
-                            )
-                        ),
-                    ] = (
-                        curr_pred.dot(
-                            self.optimal_list[mod][0][3][grp_ind][n_layer_stacking]
-                        )
-                        + self.optimal_list[mod][0][4][grp_ind][n_layer_stacking]
-                    )
-                    # X_test_n_curr[
-                    #     :,
-                    #     list(
-                    #         np.arange(
-                    #             self.inp_dim[grp_ind],
-                    #             self.inp_dim[grp_ind + 1],
-                    #         )
-                    #         # np.arange(
-                    #         #     self.n_out_subLayers * grp_ind,
-                    #         #     (grp_ind + 1) * self.n_out_subLayers,
-                    #         # )
-                    #     ),
-                    # ] = (
-                    #     X_test_scaled[:, self.list_grps[grp_ind]].dot(
-                    #         self.optimal_list[mod][0][3][grp_ind]
-                    #     )
-                    #     + self.optimal_list[mod][0][4][grp_ind]
-                    # )
-                X_test_n[mod] = X_test_n_curr
+                X_test_n[mod] = self.optimal_list[mod][0].get_prediction_group(X_test_scaled, self.inp_dim, self.list_grps)
         else:
-            X_test_n = [X.copy()]
+            X_test_n = [X_.copy()]
         self.X_test = X_test_n.copy()
         return X_test_n
 
-    def __pred_common(self, X):
+    def __pred_common(self, X, scale=True):
         """
         Parameters
         ----------
         X : {array-like, sparse-matrix}, shape (n_samples, n_features)
             The input samples.
         """
+        # Prepare the test set for the prediction
+        if scale:
+            X_ = self.__scale_test(X)
+        else:
+            X_ = X
         if not self.group_stacking:
-            X = [X[0].copy() for i in range(self.n_ensemble)]
+            X_ = [X_[0].copy() for i in range(self.n_ensemble)]
 
-        n_layer = len(self.optimal_list[0][0][0]) - 1
+        pred = [None] * len(self.optimal_list)
         for ind_mod, mod in enumerate(self.optimal_list):
-            X_test_scaled = X[ind_mod].copy()
-            for j in range(n_layer):
-                if not self.group_stacking:
-                    if len(self.list_cont) > 0:
-                        X_test_scaled[:, self.list_cont] = mod[1][0].transform(
-                            X_test_scaled[:, self.list_cont]
-                        )
-                if j == 0:
-                    pred = relu(X_test_scaled.dot(mod[0][0][j]) + mod[0][1][j])
-                else:
-                    pred = relu(pred.dot(mod[0][0][j]) + mod[0][1][j])
-
-            self.pred[ind_mod] = pred.dot(mod[0][0][n_layer]) + mod[0][1][n_layer]
+            X_test_scaled = X_[ind_mod].copy()
+            pred[ind_mod] = self.optimal_list[ind_mod][0].predict(X_test_scaled)
+        return pred
 
     def set_params(self, **kwargs):
         """Set the parameters of this estimator."""
+        # TODO considere also the case where is already fitted
         for key, value in kwargs.items():
-            setattr(self, key, value)
+            assert hasattr(self, key) or hasattr(self.estimator_default, key)
+            if hasattr(self, key):
+                setattr(self, key, value)
+            if hasattr(self.estimator_default, key):
+                setattr(self.estimator_default, key, value)
 
     def clone(self):
-        return type(self)(**self.get_params())
+        dict_param = self.get_params()
+        for key in np.copy(list(dict_param.keys())):
+            if 'estimator_default' in key:
+                del dict_param[key]
+        dict_param['estimator_default'] = self.estimator_default.clone()
+        return type(self)(** dict_param)
+
+
+def joblib_ensemble_dnnet(
+    X,
+    y,
+    estimator,
+    loss_fun,
+    prob_type="regression",
+    link_func=None,
+    list_cont=None,
+    list_grps=None,
+    bootstrap=False,
+    split_perc=0.8,
+    group_stacking=False,
+    inp_dim=None,
+    random_state=None,
+):
+    """
+    Parameters
+    ----------
+    X : {array-like, sparse-matrix}, shape (n_samples, n_features)
+        The input samples.
+    y : {array-like}, shape (n_samples,)
+        The output samples.
+    random_state: int, default=None
+        Fixing the seeds of the random generator
+    """
+
+    pred_v = np.empty(X.shape[0])
+    # Sampling and Train/Validate splitting
+    (
+        X_train_scaled,
+        y_train_scaled,
+        X_valid_scaled,
+        y_valid_scaled,
+        X_scaled,
+        y_valid,
+        scaler_x,
+        scaler_y,
+        valid_ind,
+    ) = create_X_y(
+        X,
+        y,
+        bootstrap=bootstrap,
+        split_perc=split_perc,
+        prob_type=prob_type,
+        list_cont=list_cont,
+        random_state=random_state,
+    )
+
+    param_estimator = estimator.get_params()
+    param_estimator.update({'prob_type':prob_type,
+                            'list_grps':list_grps,
+                            'group_stacking':group_stacking,
+                            'random_state':random_state,
+    })
+    current_model = type(estimator)(**param_estimator)
+    current_model.fit_validate(X_train_scaled, y_train_scaled,
+                               X_valid_scaled, y_valid_scaled
+                               )
+    if not group_stacking:
+        X_scaled_n = X_scaled.copy()
+    else:
+        X_scaled_n = current_model.get_prediction_group(X_scaled, inp_dim, list_grps)
+
+    pred = current_model.predict(X_scaled_n)
+
+    if prob_type == "regression":
+        pred_v = pred * scaler_y.scale_ + scaler_y.mean_
+    else: # "classification", "binary",  "ordinal"
+        pred_v = link_func[prob_type](pred)
+    
+    loss = loss_fun(y_valid, pred_v[valid_ind]) 
+    return (current_model, scaler_x, scaler_y, pred_v, loss)
+    
